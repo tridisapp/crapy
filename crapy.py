@@ -69,7 +69,15 @@ def build_listing_pages(first_page_url: str, max_pages: int) -> list[str]:
 
 def looks_like_bot_challenge(html: str) -> bool:
     lowered = html.lower()
-    patterns = ["captcha", "cloudflare", "vérification", "robot", "access denied"]
+    patterns = [
+        "captcha",
+        "cloudflare",
+        "vérification",
+        "verify you are human",
+        "are you human",
+        "robot",
+        "access denied",
+    ]
     return any(p in lowered for p in patterns)
 
 
@@ -77,6 +85,55 @@ def human_pause(min_ms: int, max_ms: int):
     low = min(min_ms, max_ms)
     high = max(min_ms, max_ms)
     time.sleep(random.uniform(low, high) / 1000)
+
+
+def build_browser_context(browser):
+    context = browser.new_context(
+        locale="fr-FR",
+        timezone_id="Europe/Paris",
+        viewport={"width": random.choice([1280, 1366, 1440]), "height": random.choice([820, 900, 960])},
+        user_agent=random.choice([
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        ]),
+        extra_http_headers={
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
+    context.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr', 'en-US'] });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        """
+    )
+    return context
+
+
+def goto_with_retry(page, url: str, wait_until: str, wait_ms: int, retries: int, logger) -> tuple:
+    """Retourne (response, html) en réessayant si challenge anti-bot détecté."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = page.goto(url, wait_until=wait_until)
+            page.wait_for_timeout(wait_ms)
+            html = page.content()
+            if looks_like_bot_challenge(html):
+                raise RuntimeError("challenge anti-bot détecté")
+            return response, html
+        except Exception as e:
+            last_error = e
+            if attempt >= retries:
+                break
+            backoff_s = random.uniform(5.0, 9.0) * attempt
+            logger(f"    ⚠️ tentative {attempt}/{retries} échouée ({e}), pause {backoff_s:.1f}s...")
+            time.sleep(backoff_s)
+            page.wait_for_timeout(random.randint(900, 1800))
+    raise RuntimeError(f"Impossible d'ouvrir {url} après {retries} tentatives ({last_error}).")
 
 
 def extract_product_info(url: str, html: str) -> dict:
@@ -296,13 +353,11 @@ class App(tk.Tk):
         def worker():
             try:
                 with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=headless)
-                    context = browser.new_context(
-                        locale="fr-FR",
-                        viewport={"width": 1280, "height": 900},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    browser = p.chromium.launch(
+                        headless=headless,
+                        args=["--disable-blink-features=AutomationControlled"],
                     )
+                    context = build_browser_context(browser)
                     page = context.new_page()
                     page.set_default_timeout(timeout_s * 1000)
 
@@ -311,19 +366,20 @@ class App(tk.Tk):
                     self.log_line(f"→ Pages listing à visiter: {len(listing_pages)}")
                     for idx, page_url in enumerate(listing_pages, start=1):
                         self.log_line(f"  [{idx}/{len(listing_pages)}] {page_url}")
-                        page.goto(page_url, wait_until="networkidle")
-                        page.wait_for_timeout(wait_ms)
+                        _, html = goto_with_retry(
+                            page,
+                            page_url,
+                            wait_until="domcontentloaded",
+                            wait_ms=wait_ms,
+                            retries=3,
+                            logger=self.log_line,
+                        )
 
                         for _ in range(4):
                             page.mouse.wheel(0, 2200)
                             page.wait_for_timeout(550)
 
                         html = page.content()
-                        if looks_like_bot_challenge(html):
-                            raise RuntimeError(
-                                "Page de vérification détectée (captcha/anti-bot). "
-                                "Réduis la fréquence, attends puis réessaie."
-                            )
 
                         hrefs = extract_all_hrefs(html)
                         abs_links = hrefs_to_absolute(page, hrefs)
@@ -398,20 +454,29 @@ class App(tk.Tk):
             try:
                 results = []
                 with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=headless)
-                    context = browser.new_context(
-                        locale="fr-FR",
-                        viewport={"width": 1280, "height": 900},
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    browser = p.chromium.launch(
+                        headless=headless,
+                        args=["--disable-blink-features=AutomationControlled"],
                     )
+                    context = build_browser_context(browser)
                     page = context.new_page()
                     page.set_default_timeout(timeout_s * 1000)
 
                     for i, u in enumerate(urls, start=1):
                         self.log_line(f"  [{i}/{len(urls)}] {u}")
-                        r = page.goto(u, wait_until="domcontentloaded")
-                        page.wait_for_timeout(wait_ms)
+                        try:
+                            r, html = goto_with_retry(
+                                page,
+                                u,
+                                wait_until="domcontentloaded",
+                                wait_ms=wait_ms,
+                                retries=2,
+                                logger=self.log_line,
+                            )
+                        except Exception as e:
+                            self.log_line(f"    ⚠️ {e} (skip)")
+                            continue
+
                         page.mouse.wheel(0, 1400)
                         page.wait_for_timeout(400)
 
@@ -420,10 +485,6 @@ class App(tk.Tk):
                             self.log_line(f"    ⚠️ HTTP {st} (skip)")
                             continue
 
-                        html = page.content()
-                        if looks_like_bot_challenge(html):
-                            self.log_line("    ⚠️ challenge anti-bot détecté (skip)")
-                            continue
                         results.append(extract_product_info(u, html))
                         human_pause(delay_min, delay_max)
 
