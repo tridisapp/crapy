@@ -87,6 +87,41 @@ def human_pause(min_ms: int, max_ms: int):
     time.sleep(random.uniform(low, high) / 1000)
 
 
+def imitate_entry_mouse_clicks(page, min_clicks: int = 1, max_clicks: int = 3):
+    """Imite quelques mouvements/clics souris dans des zones non interactives."""
+    candidates = page.evaluate(
+        """
+        () => {
+            const width = Math.max(window.innerWidth || 0, 1);
+            const height = Math.max(window.innerHeight || 0, 1);
+            const points = [
+                [Math.floor(width * 0.1), Math.floor(height * 0.2)],
+                [Math.floor(width * 0.15), Math.floor(height * 0.82)],
+                [Math.floor(width * 0.88), Math.floor(height * 0.18)],
+                [Math.floor(width * 0.9), Math.floor(height * 0.84)],
+                [Math.floor(width * 0.5), Math.floor(height * 0.94)],
+            ];
+            const nonInteractive = (x, y) => {
+                const el = document.elementFromPoint(x, y);
+                if (!el) return false;
+                return !el.closest('a, button, input, select, textarea, [role="button"], [onclick]');
+            };
+
+            const safePoints = points.filter(([x, y]) => nonInteractive(x, y));
+            return safePoints.length ? safePoints : [[Math.floor(width * 0.08), Math.floor(height * 0.9)]];
+        }
+        """
+    )
+
+    click_count = random.randint(max(1, min_clicks), max(min_clicks, max_clicks))
+    for _ in range(click_count):
+        x, y = random.choice(candidates)
+        page.mouse.move(x, y, steps=random.randint(12, 28))
+        page.wait_for_timeout(random.randint(120, 260))
+        page.mouse.click(x, y, delay=random.randint(40, 120))
+        page.wait_for_timeout(random.randint(180, 420))
+
+
 def build_browser_context(browser):
     context = browser.new_context(
         locale="fr-FR",
@@ -374,6 +409,7 @@ class App(tk.Tk):
                             retries=3,
                             logger=self.log_line,
                         )
+                        imitate_entry_mouse_clicks(page)
 
                         for _ in range(4):
                             page.mouse.wheel(0, 2200)
@@ -473,6 +509,7 @@ class App(tk.Tk):
                                 retries=2,
                                 logger=self.log_line,
                             )
+                            imitate_entry_mouse_clicks(page)
                         except Exception as e:
                             self.log_line(f"    ⚠️ {e} (skip)")
                             continue
