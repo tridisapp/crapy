@@ -1,6 +1,8 @@
 import threading
 import json
 import re
+import random
+import time
 from urllib.parse import urlparse
 
 import tkinter as tk
@@ -49,6 +51,32 @@ def filter_by_prefix(urls: list[str], prefix: str, only_same_domain: bool, base_
             seen.add(u)
             out.append(u)
     return out
+
+
+def build_listing_pages(first_page_url: str, max_pages: int) -> list[str]:
+    """Construit des URLs de pagination type page1.htm -> pageN.htm."""
+    max_pages = max(1, max_pages)
+    match = re.search(r"page(\d+)\.htm$", first_page_url)
+    if not match:
+        return [first_page_url]
+
+    current = int(match.group(1))
+    urls = []
+    for i in range(current, current + max_pages):
+        urls.append(re.sub(r"page\d+\.htm$", f"page{i}.htm", first_page_url))
+    return urls
+
+
+def looks_like_bot_challenge(html: str) -> bool:
+    lowered = html.lower()
+    patterns = ["captcha", "cloudflare", "vérification", "robot", "access denied"]
+    return any(p in lowered for p in patterns)
+
+
+def human_pause(min_ms: int, max_ms: int):
+    low = min(min_ms, max_ms)
+    high = max(min_ms, max_ms)
+    time.sleep(random.uniform(low, high) / 1000)
 
 
 def extract_product_info(url: str, html: str) -> dict:
@@ -142,6 +170,17 @@ class App(tk.Tk):
         self.limit_var = tk.StringVar(value="20")
         ttk.Entry(frm, textvariable=self.limit_var, width=8).grid(row=2, column=7, sticky="w", padx=6, pady=(8, 0))
 
+        ttk.Label(frm, text="Nb pages listing").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.pages_var = tk.StringVar(value="1")
+        ttk.Entry(frm, textvariable=self.pages_var, width=8).grid(row=3, column=1, sticky="w", padx=6, pady=(8, 0))
+
+        ttk.Label(frm, text="Pause aléatoire (ms)").grid(row=3, column=2, sticky="e", pady=(8, 0))
+        self.delay_min_var = tk.StringVar(value="900")
+        self.delay_max_var = tk.StringVar(value="1900")
+        ttk.Entry(frm, textvariable=self.delay_min_var, width=8).grid(row=3, column=3, sticky="w", padx=(6, 2), pady=(8, 0))
+        ttk.Label(frm, text="à").grid(row=3, column=4, sticky="w", pady=(8, 0))
+        ttk.Entry(frm, textvariable=self.delay_max_var, width=8).grid(row=3, column=5, sticky="w", padx=(2, 6), pady=(8, 0))
+
         btns = ttk.Frame(self, padding=(10, 0, 10, 10))
         btns.pack(fill="x")
 
@@ -230,6 +269,16 @@ class App(tk.Tk):
             wait_ms = 2500
 
         headless = bool(self.headless_var.get())
+        try:
+            max_pages = int(self.pages_var.get().strip())
+        except ValueError:
+            max_pages = 1
+
+        try:
+            delay_min = int(self.delay_min_var.get().strip())
+            delay_max = int(self.delay_max_var.get().strip())
+        except ValueError:
+            delay_min, delay_max = 900, 1900
 
         if not listing_url:
             messagebox.showwarning("Manquant", "Mets l’URL catégorie.")
@@ -248,28 +297,42 @@ class App(tk.Tk):
             try:
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=headless)
-                    context = browser.new_context(locale="fr-FR", viewport={"width": 1280, "height": 900})
+                    context = browser.new_context(
+                        locale="fr-FR",
+                        viewport={"width": 1280, "height": 900},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    )
                     page = context.new_page()
                     page.set_default_timeout(timeout_s * 1000)
 
-                    page.goto(listing_url, wait_until="networkidle")
-                    page.wait_for_timeout(wait_ms)
+                    all_abs_links = []
+                    listing_pages = build_listing_pages(listing_url, max_pages)
+                    self.log_line(f"→ Pages listing à visiter: {len(listing_pages)}")
+                    for idx, page_url in enumerate(listing_pages, start=1):
+                        self.log_line(f"  [{idx}/{len(listing_pages)}] {page_url}")
+                        page.goto(page_url, wait_until="networkidle")
+                        page.wait_for_timeout(wait_ms)
 
-                    # Scroll pour lazy-load
-                    for _ in range(5):
-                        page.mouse.wheel(0, 2400)
-                        page.wait_for_timeout(700)
+                        for _ in range(4):
+                            page.mouse.wheel(0, 2200)
+                            page.wait_for_timeout(550)
 
-                    html = page.content()
+                        html = page.content()
+                        if looks_like_bot_challenge(html):
+                            raise RuntimeError(
+                                "Page de vérification détectée (captcha/anti-bot). "
+                                "Réduis la fréquence, attends puis réessaie."
+                            )
 
-                    hrefs = extract_all_hrefs(html)
-                    self.log_line(f"✓ href trouvés dans HTML: {len(hrefs)}")
+                        hrefs = extract_all_hrefs(html)
+                        abs_links = hrefs_to_absolute(page, hrefs)
+                        self.log_line(f"    ✓ href: {len(hrefs)} | absolus: {len(abs_links)}")
+                        all_abs_links.extend(abs_links)
+                        human_pause(delay_min, delay_max)
 
-                    abs_links = hrefs_to_absolute(page, hrefs)
-                    self.log_line(f"✓ liens absolus construits: {len(abs_links)}")
-
-                    links = filter_by_prefix(abs_links, prefix, only_same_domain=only_same, base_url=listing_url)
-                    self.log_line(f"✓ liens après filtre prefix: {len(links)}")
+                    links = filter_by_prefix(all_abs_links, prefix, only_same_domain=only_same, base_url=listing_url)
+                    self.log_line(f"✓ liens produits uniques après filtre: {len(links)}")
 
                     context.close()
                     browser.close()
@@ -320,6 +383,11 @@ class App(tk.Tk):
             wait_ms = 2500
 
         headless = bool(self.headless_var.get())
+        try:
+            delay_min = int(self.delay_min_var.get().strip())
+            delay_max = int(self.delay_max_var.get().strip())
+        except ValueError:
+            delay_min, delay_max = 900, 1900
 
         self.scrape_btn.config(state="disabled")
         self.get_urls_btn.config(state="disabled")
@@ -331,7 +399,12 @@ class App(tk.Tk):
                 results = []
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=headless)
-                    context = browser.new_context(locale="fr-FR", viewport={"width": 1280, "height": 900})
+                    context = browser.new_context(
+                        locale="fr-FR",
+                        viewport={"width": 1280, "height": 900},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    )
                     page = context.new_page()
                     page.set_default_timeout(timeout_s * 1000)
 
@@ -348,7 +421,11 @@ class App(tk.Tk):
                             continue
 
                         html = page.content()
+                        if looks_like_bot_challenge(html):
+                            self.log_line("    ⚠️ challenge anti-bot détecté (skip)")
+                            continue
                         results.append(extract_product_info(u, html))
+                        human_pause(delay_min, delay_max)
 
                     context.close()
                     browser.close()
