@@ -35,6 +35,7 @@ Puis dans l'interface :
 Le logiciel inclut des protections **non agressives** :
 
 - pauses aléatoires entre requêtes,
+- imitation de quelques mouvements/clics souris à l'entrée d'une page,
 - détection des pages de challenge/captcha,
 - arrêt/skip en cas de blocage détecté.
 
