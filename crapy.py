@@ -171,12 +171,69 @@ def goto_with_retry(page, url: str, wait_until: str, wait_ms: int, retries: int,
     raise RuntimeError(f"Impossible d'ouvrir {url} après {retries} tentatives ({last_error}).")
 
 
-def extract_product_info(url: str, html: str) -> dict:
+def build_extraction_profile(html: str) -> dict:
+    """Construit un profil de sélecteurs à partir d'une fiche exemple."""
     soup = BeautifulSoup(html, "lxml")
+
+    profile = {
+        "title": "h1",
+        "description": "",
+        "images": "img[src]",
+    }
+
+    if soup.select_one("h1.text-trabaldo"):
+        profile["title"] = "h1.text-trabaldo"
+
+    # Cible d'abord le pattern rencontré sur trabaldogino
+    longest_mso = max(
+        (
+            (p.get_text(" ", strip=True), "p.MsoNormal")
+            for p in soup.select("p.MsoNormal")
+            if len(p.get_text(" ", strip=True)) > 120
+        ),
+        key=lambda item: len(item[0]),
+        default=("", ""),
+    )
+    if longest_mso[1]:
+        profile["description"] = longest_mso[1]
+    else:
+        for sel in [
+            ".product-description",
+            "#description",
+            ".description",
+            "[class*='description']",
+            "[id*='description']",
+            ".productDetail",
+        ]:
+            el = soup.select_one(sel)
+            if el and len(el.get_text(" ", strip=True)) > 80:
+                profile["description"] = sel
+                break
+
+    if soup.select("img[src*='/storage/']"):
+        profile["images"] = "img[src*='/storage/']"
+
+    return profile
+
+
+def extract_product_info(url: str, html: str, profile: dict | None = None) -> dict:
+    soup = BeautifulSoup(html, "lxml")
+    profile = profile or {}
 
     # TITLE
     title = ""
-    h1 = soup.select_one("h1")
+    title_selectors = [
+        profile.get("title"),
+        "h1.text-trabaldo",
+        "h1",
+    ]
+    h1 = None
+    for sel in title_selectors:
+        if not sel:
+            continue
+        h1 = soup.select_one(sel)
+        if h1:
+            break
     if h1:
         title = h1.get_text(" ", strip=True)
     if not title:
@@ -184,11 +241,34 @@ def extract_product_info(url: str, html: str) -> dict:
         if ogt and ogt.get("content"):
             title = ogt["content"].strip()
 
-    # IMAGE
-    image = ""
+    # IMAGES
+    images = []
+    image_selectors = [
+        profile.get("images"),
+        "img[src*='/storage/']",
+        "img[src]",
+    ]
+    seen_images = set()
+    for sel in image_selectors:
+        if not sel:
+            continue
+        for img in soup.select(sel):
+            src = (img.get("src") or "").strip()
+            if not src or src in seen_images:
+                continue
+            seen_images.add(src)
+            images.append(src)
+        if images:
+            break
+
     ogi = soup.select_one("meta[property='og:image']")
     if ogi and ogi.get("content"):
-        image = ogi["content"].strip()
+        og_img = ogi["content"].strip()
+        if og_img and og_img not in seen_images:
+            images.insert(0, og_img)
+            seen_images.add(og_img)
+
+    image = images[0] if images else ""
 
     # DESCRIPTION
     description = ""
@@ -196,8 +276,15 @@ def extract_product_info(url: str, html: str) -> dict:
     if md and md.get("content"):
         description = md["content"].strip()
 
+    desc_selector = profile.get("description")
+    if desc_selector:
+        el = soup.select_one(desc_selector)
+        if el:
+            description = el.get_text(" ", strip=True)
+
     if not description:
         for sel in [
+            "p.MsoNormal",
             "#description", ".description", "[class*='description']",
             ".product-description", "[id*='description']",
             ".ficheProduit", ".productDetail", "[class*='detail']"
@@ -216,7 +303,13 @@ def extract_product_info(url: str, html: str) -> dict:
                 description = p
                 break
 
-    return {"url": url, "title": title, "description": description, "image": image}
+    return {
+        "url": url,
+        "title": title,
+        "description": description,
+        "image": image,
+        "images": ";".join(images),
+    }
 
 
 # -------------------- GUI --------------------
@@ -302,16 +395,17 @@ class App(tk.Tk):
         self.url_list.configure(yscrollcommand=lscroll.set)
         lscroll.pack(side="right", fill="y")
 
-        right = ttk.LabelFrame(main, text="Aperçu résultats (title / image / description)", padding=10)
+        right = ttk.LabelFrame(main, text="Aperçu résultats (title / image(s) / description)", padding=10)
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
-        cols = ("url", "title", "image", "description")
+        cols = ("url", "title", "image", "images", "description")
         self.tree = ttk.Treeview(right, columns=cols, show="headings")
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.column("url", width=340, anchor="w")
         self.tree.column("title", width=240, anchor="w")
         self.tree.column("image", width=280, anchor="w")
+        self.tree.column("images", width=340, anchor="w")
         self.tree.column("description", width=420, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
 
@@ -343,7 +437,13 @@ class App(tk.Tk):
         for r in rows[:200]:
             desc = r.get("description", "") or ""
             short = (desc[:160] + "…") if len(desc) > 160 else desc
-            self.tree.insert("", "end", values=(r.get("url",""), r.get("title",""), r.get("image",""), short))
+            self.tree.insert("", "end", values=(
+                r.get("url", ""),
+                r.get("title", ""),
+                r.get("image", ""),
+                r.get("images", ""),
+                short,
+            ))
 
     def get_urls(self):
         listing_url = self.listing_var.get().strip()
@@ -498,6 +598,7 @@ class App(tk.Tk):
                     page = context.new_page()
                     page.set_default_timeout(timeout_s * 1000)
 
+                    extraction_profile = None
                     for i, u in enumerate(urls, start=1):
                         self.log_line(f"  [{i}/{len(urls)}] {u}")
                         try:
@@ -522,7 +623,16 @@ class App(tk.Tk):
                             self.log_line(f"    ⚠️ HTTP {st} (skip)")
                             continue
 
-                        results.append(extract_product_info(u, html))
+                        if extraction_profile is None:
+                            extraction_profile = build_extraction_profile(html)
+                            self.log_line(
+                                "    ✓ Profil extraction: "
+                                f"title={extraction_profile.get('title')} | "
+                                f"description={extraction_profile.get('description') or 'auto'} | "
+                                f"images={extraction_profile.get('images')}"
+                            )
+
+                        results.append(extract_product_info(u, html, extraction_profile))
                         human_pause(delay_min, delay_max)
 
                     context.close()
