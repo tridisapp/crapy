@@ -12,7 +12,8 @@ Pour chaque produit, l'outil tente d'extraire :
 
 - `url`
 - `title`
-- `image`
+- `image` (image principale)
+- `images` (toutes les images séparées par `;`)
 - `description`
 
 ## Usage rapide
@@ -40,3 +41,15 @@ Le logiciel inclut des protections **non agressives** :
 - arrêt/skip en cas de blocage détecté.
 
 > Important : cet outil est prévu pour un scraping respectueux (conditions d'utilisation du site, robots.txt, fréquence raisonnable). Il ne contourne pas les protections anti-bot.
+
+
+## Extraction guidée (1ère fiche -> toutes les autres)
+
+Lors du scraping des fiches sélectionnées, l'outil détecte automatiquement les sélecteurs
+les plus pertinents sur la **première fiche valide** (titre, description, images), puis
+réutilise ce profil pour extraire les mêmes champs sur les autres articles.
+
+Exemple visé pour trabaldogino.it :
+- titre : `h1.text-trabaldo`
+- description : `p.MsoNormal`
+- images : `img[src*="/storage/"]`
